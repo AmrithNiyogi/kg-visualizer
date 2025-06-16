@@ -1,0 +1,6 @@
+langchain
+langchain-openai
+fastapi[all]
+neo4j
+neo4jvis
+typing
