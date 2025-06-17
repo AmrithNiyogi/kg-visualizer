@@ -61,10 +61,11 @@ Requirements:
 - The output should ONLY be the Cypher, with NO additional text or explanations.
 - Do not wrap the Cypher in code fences or backticks.
 - If a cypher is given, do not modify it, just return it as is.
+- Only give limits when explicitly asked for them.
 Examples:
 
 Input: "Who interacts with who in the graph?"
-Output: "MATCH p = (:Character)-[r:INTERACTS]->(:Character) RETURN p LIMIT 10"
+Output: "MATCH p = (:Character)-[r:INTERACTS]->(:Character) RETURN p"
 
 Input: "List all nodes labeled Person."
 Output: "MATCH (n:Person) RETURN n LIMIT 10"
