@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict
 # from server import generate_cypher_query, generate_viz_data
 import uvicorn
-from .server import Server
+from .server_aiohttp import Server
 
 app = FastAPI()
 
@@ -27,8 +27,16 @@ def sanitize_input(input_txt: str) -> str:
 
 
 @app.get("/v1/visualizer/health")
-def health():
-    return {"status": "healthy"}
+async def health():
+    """Health endpoint that checks Neo4j connection first."""
+    is_healthy = await server.check_neo4j_health()
+    if is_healthy:
+        return {"status": "healthy"}
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "unhealthy"}
+        )
 
 @app.post("/v1/visualizer/query")
 async def query_graph(payload: Dict[str, str] = Body(...)):
@@ -44,16 +52,13 @@ async def query_graph(payload: Dict[str, str] = Body(...)):
 
     try:
         cypher = await server.generate_cypher_query(input_txt)
-
+        print(cypher)
         RELATIONSHIP_KEYWORDS = [
             "relationship",
             "relationships",
             "-[",
             "]->",
             "(:",
-            "match",
-            "create",
-            "merge",
             "with",
             "attached to",
             "is related to",
@@ -61,16 +66,33 @@ async def query_graph(payload: Dict[str, str] = Body(...)):
             "depends on",
             "linked to",
             "and their",
+            "belongs to",
+            "connected to",
+            "connected with",
+            "connected by",
+            "connected through",
+            "connected via",
+            "connected in",
+            "connected from",
+            "connected at",
+            "connected on",
+            "connected for",
+            ""
         ]
 
         # Determine whether we should use Neo4jVis or PyVis
-        if any(keyword in input_txt.lower() for keyword in RELATIONSHIP_KEYWORDS):
-            # Neo4jVis
-            data = await server.generate_viz_data(cypher)
+        # if any(keyword in input_txt.lower() for keyword in RELATIONSHIP_KEYWORDS):
+        #     # Neo4jVis
+        #     data = await server.generate_viz_data(cypher)
+        #     print(data)
 
-        else:
-            # PyVis
-            data = await server.generate_pyvis_data(cypher)
+        # else:
+        #     # PyVis
+        #     data = await server.generate_pyvis_data(cypher)
+        #     print(data)
+
+        data = await server.generate_pyvis_data(cypher)
+        # print(data)
 
         return {"status": "success", "query": cypher, "data": data}
 

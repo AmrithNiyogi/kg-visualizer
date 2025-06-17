@@ -2,6 +2,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 import os
 import json
+import logging
 
 from fastapi import HTTPException
 
@@ -13,21 +14,31 @@ from pyvis.network import Network
 from langchain_openai import AzureChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
 
+import aiohttp
+
 load_dotenv()
 
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+logger = logging.getLogger(__name__)
+
+NEO4J_URI_DOTKONNEKT = os.getenv("NEO4J_URI_DOTKONNEKT")
+NEO4J_USERNAME_DOTKONNEKT = os.getenv("NEO4J_USERNAME_DOTKONNEKT")
+NEO4J_PASSWORD_DOTKONNEKT = os.getenv("NEO4J_PASSWORD_DOTKONNEKT")
 AZURE_OPENAI_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_API_BASE = os.getenv("AZURE_OPENAI_API_BASE")
 AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
+AUTH = ("NEO4J_USERNAME_DOTKONNEKT", "NEO4J_PASSWORD_DOTKONNEKT")
+HEADERS = {"Content-Type": "application/json"}
+URI = f"{NEO4J_URI_DOTKONNEKT}/db/{os.getenv('NEO4J_DATABASE_DOTKONNEKT')}/tx/commit"
+session = None
 
-neo4j_driver = GraphDatabase.driver(
-    NEO4J_URI,
-    auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
-)
-
-graph = StyledGraph(neo4j_driver)
+async def start_session():
+    global session
+    auth = aiohttp.BasicAuth(
+        os.getenv("NEO4J_USERNAME_DOTKONNEKT"),
+        os.getenv("NEO4J_PASSWORD_DOTKONNEKT"),
+    )
+    if not session:
+        session = aiohttp.ClientSession(auth=auth)
 
 llm = AzureChatOpenAI(
     azure_deployment=AZURE_DEPLOYMENT_NAME,
@@ -49,11 +60,11 @@ Requirements:
 - The Cypher should be read-only (using MATCH).
 - The output should ONLY be the Cypher, with NO additional text or explanations.
 - Do not wrap the Cypher in code fences or backticks.
-
+- If a cypher is given, do not modify it, just return it as is.
 Examples:
 
 Input: "Who interacts with who in the graph?"
-Output: "MATCH p = (:Character)-[:INTERACTS]->(:Character) RETURN p LIMIT 10"
+Output: "MATCH p = (:Character)-[r:INTERACTS]->(:Character) RETURN p LIMIT 10"
 
 Input: "List all nodes labeled Person."
 Output: "MATCH (n:Person) RETURN n LIMIT 10"
@@ -74,6 +85,26 @@ Start now:
 """ 
 
 class Server:
+    async def check_neo4j_health(self):
+        """Verifies Neo4j connection by sending a simple query."""
+        query = "RETURN 1 LIMIT 1"
+
+        payload = {"statements": [{"statement": query}]}
+
+        try:
+            async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(*AUTH)) as sess:
+                async with sess.post(URI, json=payload, headers=HEADERS) as response:
+                    response.raise_for_status()
+                    response_json = await response.json()
+
+                    if response_json and "results" in response_json:
+                        return True
+                    return False
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+
+
     async def generate_cypher_query(self, text: str) -> str:
         """
         Generates a Cypher Query from a natural language query
@@ -97,99 +128,100 @@ class Server:
         cleaned = cleaned.removeprefix("cypher").strip()
         return cleaned
 
-    async def execute_cypher_query(self, cls, driver, query: str) -> List[dict]:
-        """Sanitize and execute a Cypher query against Neo4j and return parsed results."""
+
+    async def execute_cypher_query(
+        cls, query: str
+    ) -> List[Dict[str, Any]]:
+        """Execute a Cypher query against Neo4j via its HTTP API."""
         try:
             cleaned_query = await cls.sanitize_cypher_response(query)
-            async with driver.async_session() as session:
-                result = await session.run(cleaned_query)
-                return [record.data() for record in result]
+            if not cleaned_query:
+                raise ValueError("Cypher query cannot be empty after sanitization")
+
+            if not session:
+                await start_session()
+
+            payload = {"statements": [{"statement": cleaned_query}]}
+
+            async with session.post(URI, headers=HEADERS, json=payload) as response:
+                response.raise_for_status()
+                response_json = await response.json()
+
+            if response_json and "results" in response_json:
+                return response_json["results"][0].get("data", [])
+            return []
+
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to execute query: {str(e)}")
 
-        
-
-    async def generate_viz_data(self, cypher: str) -> Dict[str, Any]:
-        output_file = "tmp/output.html"
-
-        # Ensure directory exists
-        os.makedirs("tmp", exist_ok=True)
-
-        # Remove the file if it already exists
-        if os.path.exists(output_file):
-            os.remove(output_file)
-
-        # Generate and save the visualization
-        graph.add_from_query(cypher)
-        graph.draw(output_file)
-
-        # Read back the rendered output
-        with open(output_file, "r") as f:
-            rendered = f.read()
-
-        return {"html": rendered}
 
     async def fetch_nodes_and_edges(self, cypher: str):
         """
         Execute the Cypher query and extract nodes and edges.
         """
-        nodes = {}
+        nodes = []
         edges = []
 
-        with neo4j_driver.session() as sess:
-            result = sess.run(cypher)
+        response = await self.execute_cypher_query(cypher)
+        print(f"Response from Neo4j: {response}")
 
-            for record in result:
-                for item in record.values():
-                    if item is None:
-                        continue
+        for record in response:
+            row = record['row']
 
-                    if item.__class__.__name__ == "Node":
-                        node = item
-                        nodes[node.id] = {
-                            "id": node.id,
-                            "label": list(node.labels)[0] if node.labels else "Unknown",
-                            "properties": dict(node)
-                        }
-                    elif item.__class__.__name__ == "Relationship":
-                        rel = item
-                        edges.append({"start": rel.start_node.id, "end": rel.end_node.id})
+            if not row or len(row) == 0:
+                continue
 
-                    # If it's a path, we can extract both:
-                    elif item.__class__.__name__ == "Path":
-                        path = item
-                        for node in path.nodes:
-                            nodes[node.id] = {
-                                "id": node.id,
-                                "label": list(node.labels)[0] if node.labels else "Unknown",
-                                "properties": dict(node)
-                            }
-                        for rel in path.relationships:
-                            edges.append({"start": rel.start_node.id, "end": rel.end_node.id})
+            start_node = row[0][0]
+            relationship = row[0][1]
+            end_node = row[0][2]
 
-        return list(nodes.values()), edges
+            start_node_properties = start_node
+            end_node_properties = end_node
 
+            start_node_id = str(id(start_node))
+            end_node_id = str(id(end_node))
+
+            nodes.append({  
+                "id": start_node_id,
+                "label": start_node_properties.get("name", "Unknown"),
+                "properties": start_node_properties
+            })
+            nodes.append({  
+                "id": end_node_id,
+                "label": end_node_properties.get("wedding_season", "Unknown"),
+                "properties": end_node_properties
+            })
+            edges.append({ 
+                "start": start_node_id, 
+                "end": end_node_id,
+                "type": "RELATIONSHIP",
+                "properties": relationship
+            })
+            
+
+        return nodes, edges
 
     async def generate_pyvis_data(self, cypher: str) -> Dict[str, Any]:
-
         with open("/media/nakula/Studies/DotKonnekt/PoCs/kg-visualizer/app/template.html", "r") as f:
             HTML_TEMPLATE = f.read()
-
-
         output_file = "tmp/output.html"
-
         # Ensure directory exists
         os.makedirs("tmp", exist_ok=True)
-
         # Remove the file if it already exists
         if os.path.exists(output_file):
             os.remove(output_file)
-
         # Initialize PyVis network
-        net = Network(height='100%', width='100%', notebook=False)
-
+        net = Network(height='500px', width='1000px', notebook=False)
         # Retrieve nodes and edges
         nodes, edges = await self.fetch_nodes_and_edges(cypher)
+
+        # 🔹 PRINT debug information 🔹
+        print(f"Retrieved {len(nodes)} nodes and {len(edges)} edges.")
+        for node in nodes:
+            print(f"Node {node['id']} -> label: {node['label']} | properties: {node['properties']}")
+
+        for edge in edges:
+            print(f"Edge from {edge['start']} to {edge['end']}")
 
         # Store node details for later use in click event
         node_data = {
@@ -269,3 +301,4 @@ class Server:
             f.write(rendered)
 
         return {"html": rendered}
+
